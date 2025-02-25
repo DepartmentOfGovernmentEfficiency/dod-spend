@@ -1,6 +1,6 @@
 import requests
 from googlesearch import search
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 import time
 import argparse
@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 import threading
 import csv
 from pathlib import Path
+from collections import defaultdict
 
 DEFAULT_QUERIES = {
     "FY 2024 DoD Budget": "DoD budget FY 2024 spending cur filetype:pdf site:*.edu | site:*.org | site:*.gov -inurl:(signup | login)",
@@ -30,6 +31,38 @@ class Config:
     retry_status_codes: tuple = (429, 500, 502, 503, 504)
     search_results_limit: int = 15
     max_workers: int = 8
+    requests_per_second: float = 1.0
+    domain_rate_limit: float = 0.5
+    min_request_delay: float = 0.5
+
+class RateLimiter:
+    def __init__(self, config: Config):
+        self.config = config
+        self.domain_timestamps = defaultdict(list)
+        self.global_timestamps = []
+        self.lock = threading.Lock()
+
+    def wait(self, url: str) -> None:
+        domain = urlparse(url).netloc
+        current_time = time.time()
+
+        with self.lock:
+            self.global_timestamps = [t for t in self.global_timestamps if current_time - t < 1.0]
+            self.domain_timestamps[domain] = [t for t in self.domain_timestamps[domain] if current_time - t < 1.0]
+
+            if len(self.global_timestamps) >= int(self.config.requests_per_second):
+                sleep_time = 1.0 - (current_time - self.global_timestamps[0])
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+
+            if len(self.domain_timestamps[domain]) >= int(self.config.domain_rate_limit):
+                sleep_time = 1.0 - (current_time - self.domain_timestamps[domain][0])
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+
+            self.global_timestamps.append(time.time())
+            self.domain_timestamps[domain].append(time.time())
+            time.sleep(self.config.min_request_delay)
 
 class SessionManager:
     def __init__(self, config: Config):
@@ -51,6 +84,7 @@ class PDFSearcher:
         self.config = config
         self.lock = threading.Lock()
         self.cache = set()
+        self.rate_limiter = RateLimiter(config)
 
     def find_pdf_links(self, query: str, verbose: bool = False) -> Set[str]:
         pdf_links = set()
@@ -69,6 +103,7 @@ class PDFSearcher:
             if url in self.cache:
                 return
             self.cache.add(url)
+        self.rate_limiter.wait(url)
         try:
             if url.endswith(".pdf"):
                 self._check_direct_pdf(url, pdf_links, verbose)
@@ -79,6 +114,7 @@ class PDFSearcher:
                 logging.debug(f"Error processing {url}: {e}")
 
     def _check_direct_pdf(self, url: str, pdf_links: Set[str], verbose: bool) -> None:
+        self.rate_limiter.wait(url)
         try:
             response = self.session.head(url, timeout=self.config.timeout, allow_redirects=True)
             if response.status_code == 200 and "application/pdf" in response.headers.get("Content-Type", ""):
@@ -90,6 +126,7 @@ class PDFSearcher:
             pass
 
     def _scrape_page_for_pdfs(self, url: str, pdf_links: Set[str], verbose: bool) -> None:
+        self.rate_limiter.wait(url)
         try:
             response = self.session.get(url, timeout=self.config.timeout)
             response.raise_for_status()
