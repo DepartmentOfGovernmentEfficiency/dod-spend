@@ -17,23 +17,23 @@ from pathlib import Path
 from collections import defaultdict
 
 DEFAULT_QUERIES = {
-    "FY 2024 DoD Budget": "DoD budget FY 2024 spending cur filetype:pdf site:*.edu | site:*.org | site:*.gov -inurl:(signup | login)",
-    "FY 2025 DoD Budget": "DoD budget FY 2025 spending cur filetype:pdf site:*.edu | site:*.org | site:*.gov -inurl:(signup | login)",
-    "FY 2024/2025 DoD Vendor Spending": "DoD vendor spending FY 2024 OR FY 2025 cur filetype:pdf site:*.edu | site:*.org | site:*.gov -inurl:(signup | login)"
+    "FY 2024 DoD Budget": "DoD budget FY 2024 spending cur filetype:pdf site:*.gov -inurl:(signup | login)",
+    "FY 2025 DoD Budget": "DoD budget FY 2025 spending cur filetype:pdf site:*.gov -inurl:(signup | login)",
+    "FY 2024/2025 DoD Vendor Spending": "DoD vendor spending FY 2024 OR FY 2025 cur filetype:pdf site:*.gov -inurl:(signup | login)"
 }
 
 @dataclass
 class Config:
-    timeout: int = 5
+    timeout: int = 10  # Increased timeout
     user_agent: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
     max_retries: int = 3
     backoff_factor: float = 1.5
     retry_status_codes: tuple = (429, 500, 502, 503, 504)
-    search_results_limit: int = 15
+    search_results_limit: int = 20  # Increased limit
     max_workers: int = 8
-    requests_per_second: float = 1.0
-    domain_rate_limit: float = 0.5
-    min_request_delay: float = 0.5
+    requests_per_second: float = 2.0  # Relaxed
+    domain_rate_limit: float = 1.0    # Relaxed
+    min_request_delay: float = 0.25   # Reduced
 
 class RateLimiter:
     def __init__(self, config: Config):
@@ -91,7 +91,11 @@ class PDFSearcher:
         if verbose:
             logging.info(f"Searching: {query}")
         try:
-            search_results = list(search(query, num_results=self.config.search_results_limit))
+            search_results = list(search(query, num_results=self.config.search_results_limit, pause=2.0))
+            if verbose:
+                logging.info(f"Found {len(search_results)} initial search results")
+                for result in search_results:
+                    logging.debug(f"Search result: {result}")
             with ThreadPoolExecutor(max_workers=self.config.max_workers) as executor:
                 executor.map(lambda url: self._process_url(url, pdf_links, verbose), search_results)
         except Exception as e:
@@ -103,6 +107,8 @@ class PDFSearcher:
             if url in self.cache:
                 return
             self.cache.add(url)
+        if verbose:
+            logging.debug(f"Processing URL: {url}")
         self.rate_limiter.wait(url)
         try:
             if url.endswith(".pdf"):
@@ -117,13 +123,17 @@ class PDFSearcher:
         self.rate_limiter.wait(url)
         try:
             response = self.session.head(url, timeout=self.config.timeout, allow_redirects=True)
-            if response.status_code == 200 and "application/pdf" in response.headers.get("Content-Type", ""):
+            content_type = response.headers.get("Content-Type", "")
+            if verbose:
+                logging.debug(f"HEAD {url} - Status: {response.status_code}, Content-Type: {content_type}")
+            if response.status_code == 200 and "application/pdf" in content_type:
                 with self.lock:
                     pdf_links.add(url)
                 if verbose:
-                    logging.debug(f"Found PDF: {url}")
-        except requests.RequestException:
-            pass
+                    logging.info(f"Found PDF: {url}")
+        except requests.RequestException as e:
+            if verbose:
+                logging.debug(f"Request failed for {url}: {e}")
 
     def _scrape_page_for_pdfs(self, url: str, pdf_links: Set[str], verbose: bool) -> None:
         self.rate_limiter.wait(url)
@@ -133,10 +143,13 @@ class PDFSearcher:
             soup = BeautifulSoup(response.text, "html.parser")
             pdf_urls = {urljoin(url, link["href"]) for link in soup.find_all("a", href=True) 
                        if link["href"].endswith(".pdf")}
+            if verbose:
+                logging.debug(f"Found {len(pdf_urls)} potential PDF links on {url}")
             with ThreadPoolExecutor(max_workers=self.config.max_workers) as executor:
                 executor.map(lambda pdf_url: self._check_direct_pdf(pdf_url, pdf_links, verbose), pdf_urls)
-        except requests.RequestException:
-            pass
+        except requests.RequestException as e:
+            if verbose:
+                logging.debug(f"Failed to scrape {url}: {e}")
 
 class FileHandler:
     @staticmethod
