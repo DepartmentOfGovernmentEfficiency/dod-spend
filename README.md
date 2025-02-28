@@ -10,6 +10,7 @@ This Python script searches for publicly available **Department of Defense (DoD)
 - **Extracts direct PDF links** from Google search results.
 - **Checks web pages for embedded PDFs** if direct links are not found.
 - **Displays results in color** for improved readability.
+- **Reverse Proxy.** 
 - **Saves PDF links to a text file** (`dod_spending_pdfs.txt`).
 
 ## Requirements
